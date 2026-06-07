@@ -100,4 +100,173 @@ public class DiagnosisService {
 
         // 🌟 [프로브 센서 4] ★가장 유력★ 운영 데이터베이스 질병 마스터 데이터 부재 검증 레이어
         EyeDiseaseCode disease = eyeDiseaseCodeRepository
-                .findByDiseaseNameAndInputSpeciesAnd
+                .findByDiseaseNameAndInputSpeciesAndAffectedArea(
+                        diseaseName,
+                        species,
+                        affectedArea
+                )
+                .orElseThrow(() -> new IllegalArgumentException(
+                        "PROBE_ERROR [Database Master Data]: 현재 운영 DB의 eye_disease_code 테이블에 해당 질병 마스터 데이터가 존재하지 않습니다! 즉시 인서트가 필요한 데이터 세트 명세 -> [diseaseName=" + diseaseName
+                                + ", species=" + species
+                                + ", affectedArea=" + affectedArea + "]"
+                ));
+
+        Diagnosis diagnosis = new Diagnosis();
+        diagnosis.setPet(pet);
+        diagnosis.setDiagnosisDate(LocalDate.now(ZoneId.of("Asia/Seoul")));
+        diagnosis.setImageUrl(imageUrl);
+        diagnosis.setDisease(disease);
+
+        diagnosis.setSymptomIds(
+                symptomIds == null ? "" :
+                        symptomIds.stream()
+                                .map(String::valueOf)
+                                .collect(Collectors.joining(","))
+        );
+
+        diagnosis.setTriageKey(aiResponse.getTriage());
+        diagnosis.setTriageConfidence(aiResponse.getTriageConfidence());
+
+        diagnosis.setGuideMsg(aiResponse.getGuidanceMessage());
+        diagnosis.setGuideAction(aiResponse.getGuidanceAction());
+        diagnosis.setGuideWarn(aiResponse.getGuidanceWarning());
+
+        // 🌟 [프로브 센서 5] 신뢰도 커트라인 진입 및 영속성 컨텍스트(DB 저장) 예외 포착 레이어
+        if (aiResponse.getTriageConfidence() >= 0.4f) {
+            try {
+                diagnosisRepository.save(diagnosis);
+            } catch (Exception e) {
+                throw new RuntimeException("PROBE_ERROR [JPA Database Save]: AI 진단 결과 DB 저장(Insert) 과정에서 제약조건 위반 혹은 영속성 예외가 발생했습니다. 원인=" + e.getMessage());
+            }
+        }
+
+        return new DiagnosisResponse(
+                imageUrl,
+                formatStatus(aiResponse.getTriage()),
+                diseaseName,
+                formatAffectedArea(aiResponse.getFamilyLabel()),
+                formatConfidence(aiResponse.getTriageConfidence()),
+                aiResponse.getGuidanceAction(),
+                aiResponse.getGuidanceMessage(),
+                aiResponse.getGuidanceWarning()
+        );
+    }
+
+    public RecentDiagnosisResponse getTodayDiagnosis(Long memberId, Long petId, LocalDate date) {
+        Pet pet = petRepository.findById(petId)
+                .orElseThrow(() -> new IllegalArgumentException("존재하지 않는 반려동물입니다."));
+
+        if (!pet.getMember().getMemberId().equals(memberId)) {
+            throw new SecurityException("해당 반려동물에 대한 접근 권한이 없습니다.");
+        }
+
+        return diagnosisRepository
+                .findTopByPet_PetIdAndDiagnosisDateOrderByDiagnosisIdDesc(petId, date)
+                .map(d -> {
+                    List<Long> checkedIds = parseSymptomIds(d.getSymptomIds());
+                    List<RecentDiagnosisResponse.SymptomChecklist> symptoms =
+                            buildSymptomChecklist(checkedIds);
+
+                    return toRecentDiagnosisResponse(d, symptoms);
+                })
+                .orElseGet(() -> RecentDiagnosisResponse.empty(buildSymptomChecklist(List.of())));
+    }
+
+    private int calculateAge(int birthYear) {
+        return Year.now().getValue() - birthYear;
+    }
+
+    private String formatAffectedArea(String area) {
+        if (area == null) return null;
+
+        return switch (area) {
+            case "cornea_ulcerative", "cornea_nonulcerative" -> "각막";
+            case "conjunctiva" -> "결막";
+            case "eyelid" -> "눈꺼풀";
+            case "lens_vitreous" -> "수정체/유리체";
+            case "tear" -> "눈물";
+            case "normal" -> "정상";
+            default -> area;
+        };
+    }
+
+    private String formatStatus(String triage) {
+        if (triage == null || triage.isBlank()) return "UNKNOWN";
+        return triage.trim().toUpperCase();
+    }
+
+    private String normalizeDiseaseName(String diseaseName) {
+        if (diseaseName == null || diseaseName.isBlank()) {
+            throw new IllegalArgumentException("AI 질병명이 비어 있습니다.");
+        }
+
+        return switch (diseaseName.toLowerCase()) {
+            case "normal" -> "정상";
+            default -> diseaseName.trim();
+        };
+    }
+
+    private String normalizeSpecies(String species) {
+        if (species == null || species.isBlank()) {
+            throw new IllegalArgumentException("반려동물 종 정보가 비어 있습니다.");
+        }
+
+        return switch (species.toLowerCase()) {
+            case "dog", "강아지", "개" -> "DOG";
+            case "cat", "고양이" -> "CAT";
+            default -> species.toUpperCase();
+        };
+    }
+
+    private int formatConfidence(double confidence) {
+        return (int) Math.round(confidence * 100);
+    }
+
+    private RecentDiagnosisResponse toRecentDiagnosisResponse(
+            Diagnosis d,
+            List<RecentDiagnosisResponse.SymptomChecklist> symptoms
+    ) {
+        return new RecentDiagnosisResponse(
+                true,
+                d.getImageUrl(),
+                formatStatus(d.getTriageKey()),
+                d.getDisease().getDiseaseName(),
+                formatAffectedArea(d.getDisease().getAffectedArea()),
+                formatConfidence(d.getTriageConfidence()),
+                d.getGuideAction(),
+                d.getGuideMsg(),
+                d.getGuideWarn(),
+                symptoms
+        );
+    }
+
+    private List<RecentDiagnosisResponse.SymptomChecklist> buildSymptomChecklist(List<Long> checkedIds) {
+        return Arrays.stream(EyeSymptom.values())
+                .filter(symptom -> checkedIds.contains(symptom.getId()))
+                .map(symptom -> new RecentDiagnosisResponse.SymptomChecklist(
+                        symptom.getId(),
+                        symptom.getDescription()
+                ))
+                .toList();
+    }
+
+    private List<Long> parseSymptomIds(String symptomIds) {
+        if (symptomIds == null || symptomIds.isBlank()) {
+            return List.of();
+        }
+
+        return Arrays.stream(symptomIds.split(","))
+                .map(String::trim)
+                .filter(value -> !value.isBlank())
+                .map(Long::valueOf)
+                .toList();
+    }
+
+    private String normalizeAffectedArea(String affectedArea) {
+        if (affectedArea == null || affectedArea.isBlank()) {
+            throw new IllegalArgumentException("AI affectedArea 값이 비어 있습니다.");
+        }
+
+        return affectedArea.trim();
+    }
+}
